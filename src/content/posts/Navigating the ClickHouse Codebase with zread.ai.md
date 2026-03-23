@@ -1,4 +1,4 @@
-﻿t ---
+﻿---
 title: Navigating the ClickHouse Codebase with zread.ai
 published: 2026-03-23
 description: 'This is about how to use cursor rules'
