@@ -1,4 +1,4 @@
-t ---
+---
 title: A Better Usage of Cursor Rules
 published: 2025-08-21
 description: 'This is about how to use cursor rules'
