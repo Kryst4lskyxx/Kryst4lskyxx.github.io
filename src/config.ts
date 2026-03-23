@@ -16,9 +16,9 @@ import type {
 import { LinkPreset } from "./types/config";
 
 export const siteConfig: SiteConfig = {
-	title: "我的博客",
-	subtitle: "用 Astro 和 Fuwari 构建的个人博客",
-	lang: "zh_CN", // 'en', 'zh_CN', 'zh_TW', 'ja', 'ko', 'es', 'th'
+	title: "kryst4lskyxx",
+	subtitle: "Big data, dev tooling, and the tech in between",
+	lang: "en", // 'en', 'zh_CN', 'zh_TW', 'ja', 'ko', 'es', 'th'
 	themeColor: {
 		hue: 250, // Default hue for the theme color, from 0 to 360. e.g. red: 0, teal: 200, cyan: 250, pink: 345
 		fixed: false, // Hide the theme color picker for visitors
@@ -63,7 +63,7 @@ export const navBarConfig: NavBarConfig = {
 export const profileConfig: ProfileConfig = {
 	avatar: "assets/images/avatar.jpg", // Relative to the /src directory. Relative to the /public directory if it starts with '/'
 	name: "kryst4lskyxx",
-	bio: "To be a good programmer",
+	bio: "Big data engineer. ClickHouse, pipelines, and the tooling that makes it bearable.",
 	links: [
 		{
 			name: "Twitter",
