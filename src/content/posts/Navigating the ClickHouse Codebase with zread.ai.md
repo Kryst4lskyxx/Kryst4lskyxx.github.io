@@ -1,7 +1,7 @@
 ﻿---
 title: Navigating the ClickHouse Codebase with zread.ai
 published: 2026-03-23
-description: 'This is about how to use cursor rules'
+description: 'This is about my experience of using Zread.ai'
 image: ''
 tags: [ClickHouse, Big Data Engineering, Developer Tooling, Source Code Reading]
 category: 'Coding'
