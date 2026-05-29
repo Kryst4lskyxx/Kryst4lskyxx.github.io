@@ -82,17 +82,23 @@ To understand why, we need the concurrency-control model.
 
 ## How ClickHouse concurrency control works
 
+### Why it exists at all
+
+The [official architecture docs](https://clickhouse.com/docs/development/architecture#concurrency-control) frame the problem cleanly. A parallelizable query uses `max_threads`, whose default is deliberately chosen so that **one query can fully saturate every CPU core**. That's great in isolation — but the moment several queries run concurrently, each still asks for enough threads to use all cores. They oversubscribe the CPU, the OS steps in to enforce fairness by context-switching, and you pay a penalty. As the docs put it, `ConcurrencyControl` exists to *"deal with this penalty and avoid allocating a lot of threads."*
+
+This is exactly the trap behind the incident above: `max_threads=20` was the per-query multiplier, and nothing reconciled the sum of those demands with the real core count.
+
 ### The model: a slot = the right to run one thread
 
-ClickHouse maintains a single server-wide pool of **CPU slots**. One slot ≈ permission for one query thread to run. A query wanting N threads must acquire N slots. Each slot has a lifecycle (`src/Common/ConcurrencyControl.h`):
+ClickHouse maintains a single server-wide pool of **CPU slots**. A slot is, in the docs' words, *"a unit of concurrency"*: to run a thread, a query must **acquire a slot in advance and release it when the thread stops**. A query wanting N threads must acquire N slots. Each slot is *"an independent state machine"* with a lifecycle (`src/Common/ConcurrencyControl.h`):
 
 ```
 free  ->  granted  ->  acquired  ->  free
 ```
 
-- **free** — available to any query
-- **granted** — reserved for a query, no thread using it yet
-- **acquired** — a thread has picked it up and is running
+- **free** — *"available to be allocated by any query."*
+- **granted** — *"allocated by specific query, but not yet acquired by any thread."* A short, transitional state.
+- **acquired** — *"allocated by specific query and acquired by a thread."* The thread is running.
 - back to **free** when the thread finishes
 
 ### How one query requests slots
@@ -112,6 +118,12 @@ Every query calls `allocate(min = 1, max = max_threads)`:
 - **max = `max_threads`** → desired parallelism; the other `max_threads − 1` are *competing* slots it may have to wait for.
 
 This is the crux: **`max_threads` directly sets how many competing slots each query demands.** A query with `max_threads=20` demands **19** competing slots.
+
+The docs distill the whole mechanism into a three-function API:
+
+1. **Allocate** — `auto slots = ConcurrencyControl::instance().allocate(1, max_threads);` reserves at least 1 and at most `max_threads` slots. The first is granted immediately; the rest may arrive later. This is what makes the limit *soft* — every query is guaranteed its one thread.
+2. **Acquire** — `while (auto slot = slots->tryAcquire()) spawnThread(...);` a thread picks up a granted slot and starts. `tryAcquire` is non-blocking: if no slot is available, the query simply runs with fewer threads rather than waiting.
+3. **Resize** — `ConcurrencyControl::setMaxConcurrency(concurrent_threads_soft_limit_num)` changes the total pool size **at runtime, without a restart** — which is why the ratio/limit settings below are reloadable.
 
 ### The two schedulers — and oversubscription
 
@@ -136,7 +148,7 @@ state.cur_concurrency += granted;     // min is NOT counted
 
 Only competing slots count, so total acquired can never exceed the limit → no oversubscription at the ClickHouse layer, and `max_threads=1` queries need zero competing slots (perfectly fair).
 
-> **Key caveat:** `fair_round_robin` prevents oversubscription *of the slot budget*. But if you set the budget itself above the core count (ratio 4 → 720 slots on 180 cores), you've re-introduced oversubscription at the **OS** level — the kernel, not ClickHouse, then does the throttling (the 7 s `pthread_create`).
+> **Key caveat:** When the header comment in `ConcurrencyControl.h` says of `fair_round_robin` *"There is no oversubscription: total amount of allocated slots CANNOT exceed `setMaxConcurrency(limit)`"*, it means oversubscription **of the slot budget** — slot *accounting*, not CPU cores. (For `round_robin` the same comment says the opposite: *"Oversubscription is possible … because `min` amount of slots is allocated for each query unconditionally."*) That guarantee says nothing about whether the budget itself is sane: set it above the core count (ratio 4 → 720 slots on 180 cores) and `fair_round_robin` will faithfully keep acquired slots ≤ 720 while the **OS** is hopelessly oversubscribed. The kernel, not ClickHouse, then does the throttling (the 7 s `pthread_create`).
 
 ### The settings
 
