@@ -197,6 +197,61 @@ It is a thread-creation **rate** failure under a query stampede, not a quota cei
 
 A note on honesty: I did not capture the exact `errno` (`EAGAIN` vs `ENOMEM`). The evidence makes `ENOMEM`-under-burst overwhelmingly likely, but the only way to be certain is `dmesg -T` around an incident (look for "page allocation failure" / "fork") or `perf trace -e clone,clone3` on a canary during a burst. The fix below does not depend on which it is, because both are cured by not creating thousands of threads in one second.
 
+## Wait — why wasn't the CPU pinned?
+
+The natural objection: a "stampede" that fails to create threads should be hammering the CPU, but the dashboards showed only 30-40%. That low number is not a contradiction. It is the proof. If this were a compute-bound problem you would see CPU near 100% and the fix would be more cores. Idle cores during the failure mean the work is **blocked**, not running — the fingerprint of a coordination problem, not a capacity one.
+
+To see it, pull per-node CPU and the thread storm together from `metric_log` (the CPU lives there as the `OSCPUVirtualTimeMicroseconds` ProfileEvent, so `delta / 1e6` ≈ cores the process actually burned). One caveat that bites everyone: across `clusterAllReplicas` you **must** `PARTITION BY` the node in the window, or `lagInFrame` diffs one node against another and produces garbage:
+
+```sql
+SELECT
+    host, event_time, queries, gthread,
+    round((cpu_us - lagInFrame(cpu_us) OVER w) / 1e6, 1) AS ch_cores_busy,   -- vs 180 cores
+    round((tc_us  - lagInFrame(tc_us)  OVER w) / 1e6, 1) AS thread_create_s,
+    round((lk_us  - lagInFrame(lk_us)  OVER w) / 1e6, 1) AS pool_lock_wait_s,
+    expansions    - lagInFrame(expansions) OVER w        AS threads_created
+FROM (
+    SELECT hostName() AS host, event_time,
+           CurrentMetric_Query                                     AS queries,
+           CurrentMetric_GlobalThread                              AS gthread,
+           ProfileEvent_OSCPUVirtualTimeMicroseconds              AS cpu_us,
+           ProfileEvent_GlobalThreadPoolThreadCreationMicroseconds AS tc_us,
+           ProfileEvent_GlobalThreadPoolLockWaitMicroseconds      AS lk_us,
+           ProfileEvent_GlobalThreadPoolExpansions                AS expansions
+    FROM clusterAllReplicas('<cluster>', system.metric_log)
+    WHERE event_time BETWEEN '2026-06-01 08:37:55' AND '2026-06-01 08:38:05'
+)
+WINDOW w AS (PARTITION BY host ORDER BY event_time)
+ORDER BY gthread DESC;
+```
+
+The coordinator caught at the failure instant:
+
+| time | queries | gthread | threads_created | thread_create (core-s) | pool_lock_wait (core-s) | **ch_cores_busy** |
+|---|---|---|---|---|---|---|
+| 08:37:58 | 0 | 1780 | 0 | 0 | 0 | ~0 |
+| **08:37:59** | **589** | **6337** | **4576** | **29.5** | 0.7 | **10.4** |
+| 08:38:00 | 689 | 2415 | — | 15.5 | **40.6** | 32.7 |
+
+Read the failure second. The pool exploded 1,780 → 6,337 (**~4,576 threads created in one second**), which cost **~29.5 core-seconds of thread-creation time**; the next second, **~40.6 core-seconds went to waiting on the pool mutex** (`GlobalThreadPoolLockWaitMicroseconds`, the single lock every `scheduleImpl` takes). And the CPU the server actually burned: **`ch_cores_busy = 10.4`** — ten cores out of 180, about **6%**. At the moment it was throwing 439s, the node spent ~10 cores computing while ~30 core-seconds went to *birthing threads* and ~40 to *lock contention*. A thread blocked in `clone()`/`mmap` or parked on a mutex consumes zero CPU, so it all reads as idle. (On a participant node the OS gauges told the same story: at the peak second, kernel `system` time was ~3× user time — the busy cores were in the kernel doing thread setup, not running queries.)
+
+And the reason the *cluster* average looks low: of 8 nodes, only **two** expanded their pool at all.
+
+| node | queries @ :59 | gthread @ :59 | |
+|---|---|---|---|
+| 1-0-0 | 589 | **6337** | coordinator — pool exploded, threw 439s |
+| 2-1-0 | 358 | **3819** | coordinator — pool exploded |
+| 0-0-0 | 279 | 2009 | participant — barely grew |
+| 2-0-0 | 510 | 1780 | participant — **flat** |
+| 1-1-0 | 556 | 1779 | participant — **flat** |
+| 0-1-0 | 325 | 1780 | participant — flat |
+| 3-0-0 | 264 | 1780 | participant — flat |
+| 3-1-0 | 212 | 1768 | participant — flat |
+
+The six participant nodes absorbed 200-560 queries each **without creating a single thread** — their `gthread` stays pinned at ~1,780 because they had ~1,000 idle threads already in the pool. Only the two **initiator/coordinator** nodes, which open a thread per outbound shard connection × query, blew past their idle headroom, had to `clone()` thousands at once, and hit the kernel wall. Nobody was compute-bound; peak `ch_cores_busy` anywhere was ~94 (≈52% of 180) and only for a single second as queries briefly ran. More cores would change nothing.
+
+(Counter caveat: `threads_created` / `thread_create` go slightly negative on rows after the spike — a cumulative-counter ordering artifact when several `metric_log` rows share one `event_time` within a host. Trust the peak-second value; the negatives are noise, not real shrinkage.)
+
 ## The fix
 
 **1. Throttle admission — the primary fix, targeting the proven trigger.**
@@ -231,3 +286,4 @@ Roll out #1 alone first and confirm the 439 storms stop. Add #2 if they persist 
 - **Idle snapshots lie about bursty failures.** Every OS limit looked healthy at rest. The answer was only visible at the failure second — and `system.metric_log` / `asynchronous_metric_log` already had it recorded, no live reproduction needed.
 - **Correlate, do not assume.** The failure tracked exactly one variable — concurrent `Query` count — not threads, not memory, not any quota. A query-admission stampede plus an unbounded `max_concurrent_queries` was the whole story.
 - **`pthread_create` can fail with free memory.** Under a high enough spawn *rate*, transient `ENOMEM` from stack allocation (fragmentation, THP compaction) refuses threads while hundreds of GiB sit available. The cure is to lower the rate, not to add memory.
+- **Low CPU during the failure is evidence, not noise.** At the failure instant the coordinator burned ~10 of 180 cores (~6%) while spending ~30 core-seconds creating threads and ~40 on lock contention. Blocked threads (in `clone()`, `mmap`, or a mutex) cost zero CPU, so a coordination bottleneck reads as idle. If the box isn't pinned, stop looking for a compute fix.
