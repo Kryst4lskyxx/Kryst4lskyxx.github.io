@@ -7,6 +7,7 @@ tags: [ClickHouse, Big Data Engineering, Performance Tuning, Concurrency, Kubern
 category: 'Coding'
 draft: false 
 lang: 'en'
+slug: diagnosing-clickhouse-concurrency-control
 ---
 
 ## The symptom
@@ -21,6 +22,8 @@ Code: 210. DB::NetException: I/O error: Broken pipe, while writing to socket
 The user-facing query *succeeded* every time. So why the exception, and what was it telling us? The answer turned out to be a tour through ClickHouse's CPU-slot **concurrency control** — and a misconfiguration that was quietly throttling almost every query on the cluster.
 
 This post walks the investigation and then explains the concurrency-control settings and metrics in detail, grounded in the 25.8 source.
+
+> **Related:** a later incident on the same cluster — `CANNOT_SCHEDULE_TASK` thread-spawn failures under a query stampede — is dissected in [Debugging ClickHouse CANNOT_SCHEDULE_TASK](./debugging-clickhouse-cannot-schedule-task/).
 
 ## Step 1: the broken pipe is benign — it's hedged requests
 
