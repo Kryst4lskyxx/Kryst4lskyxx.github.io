@@ -79,6 +79,20 @@ Reach for DeepWiki when you want a fast, free, architecture-first first read. Re
 
 ## Where AI falls short
 
+The orientation story is appealing. It is also partial. AI genuinely accelerates the initial map-making — but that is a low-stakes task. The moment you ask the model to deeply understand a large codebase on your behalf, you enter territory where the tools systematically fail and the failure is hard to detect.
+
+**The practitioner's report.** Alexey Milovidov, creator of ClickHouse, has written about [agentic coding on the ClickHouse codebase](https://clickhouse.com/blog/agentic-coding). On a big C++ base the agent gets lost. It hallucinates command-line parameters that no longer exist. It reintroduces architectural patterns that were deliberately refactored out years ago, because its training data is stale. It makes poor design decisions and is best confined to small, well-scoped tasks. The key observation: during a hard bug hunt the agent generated "a lot of false but convincing hypotheses" that you have to spend time rejecting before you can find the real cause. And AI is a multiplier — a good engineer who validates every change becomes more productive, a careless one who trusts the output does more harm. The discipline that makes it work is unforgiving: validate every change, lean on your test suite and CI, and remember that the agent does, you review.
+
+**The controlled study.** METR ran a [randomized controlled trial](https://metr.org/blog/2025-07-10-early-2025-ai-experienced-os-dev-study/) with 16 experienced open-source developers working on repositories they had contributed to for about 5 years on average. With early-2025 AI tools they were 19% slower than without the tools — while they believed they were about 20% faster. That perception gap is the lesson. The time goes into verifying and cleaning up AI output, and experts on familiar code have little room to gain because they already know where things are. The study is a snapshot of early-2025 tooling and the confidence interval is wide, but the finding is humbling: the people who should benefit most — experts on their own codebases — are slowed down, and they do not notice.
+
+**The mechanism.** This is not a prompt-engineering problem you can fix. LLMs predict the next token. When the answer is not well represented in the training data they produce something plausible rather than refusing to answer. Two documented effects make this worse on large codebases. First, "lost in the middle": a 2023 Stanford/Berkeley study showed that attention is U-shaped. Models attend strongly to the start and end of the context window and weakly to the middle. Relevant material buried in the middle can drop accuracy by 30% or more. Second, "context rot": across many models tested, every one degrades as context size grows. Distractor interference is especially nasty for code, where many functions and variable names look alike and actively mislead the model. Bigger context windows do not fix this — the effective context is far below the advertised token limit.
+
+Put the layers together. Orientation is exactly the low-stakes, easily verifiable task AI is good at. "Read and understand all of this for me" is exactly the high-stakes, hard-to-verify task it is bad at. The model will give you an answer either way. The difference is whether you can catch the error before it costs you time.
+
+:::warning
+Don't let AI read *all* the code for you. It is a tool of thought, not a replacement for thinking. Treat every AI explanation as a hypothesis to confirm against the source — not a citation.
+:::
+
 ## The trail in practice: CANNOT_SCHEDULE_TASK
 
 ## Takeaways
