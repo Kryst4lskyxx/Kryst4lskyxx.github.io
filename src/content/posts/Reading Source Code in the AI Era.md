@@ -26,7 +26,21 @@ Every one of these moves is something AI can accelerate. But the judgment in the
 
 ## Why and when to reach for AI
 
+LLMs genuinely help with the friction of initial comprehension. Summarizing what a module does. Explaining an unfamiliar idiom you've never seen. Translating low-level implementation into high-level intent. These are all first-pass orientation tasks where you need a plausible narrative to get started, not ground truth. The model gives you that narrative. You then verify it.
+
+The right comprehension order mirrors how professional code auditors work: global to local. Start with the project overview, then the structure and business logic, then the local functions. Prompt in that order. Ask for the architecture before you ask about a single function. Ask what a subsystem does before you ask how a method works. This is how you orient without getting lost in implementation details that only make sense once you have the map.
+
+When to reach for it: you are facing a large unfamiliar codebase. You need to know where something actually happens. You want a narrative map of a subsystem before you start reading files. You want to surface community footguns before you touch a subsystem. The value is highest when you have no prior context. The model shortens the time from zero knowledge to rough orientation.
+
+When not to: you already know the area well. Experts gain little and can even lose time — we'll cover this in the limitations section. Anything security-critical where you need ground truth rather than a plausible summary. Anything where the cost of being wrong is high and the cost of reading the real source is low. The model is a shortcut to orientation, not a replacement for verification.
+
 ## A workflow for reading with AI
+
+Three moves work reliably. **Orient first.** Get the generated map before you start reading. Don't open a random file and ask the model what it does. Ask for the overview, the module structure, the control flow. Then drill down. You want the narrative before the details. **Ask "why," not just "where."** "Where is the merge logic" gets you a file path. "Why does ClickHouse use a greedy merge selector instead of a cost-based one" gets you the reasoning that actually teaches you the system. The second question is harder to answer but far more valuable. It forces the model to explain trade-offs, not just locate code. **Always land in real source and verify.** The AI's answer is a hypothesis, not a citation. Map the summary back to a code category — glue, interface, implementation, whatever — and read the actual file. If the model says "the executor schedules tasks in `ThreadPool.cpp`," open `ThreadPool.cpp` and confirm that `schedule` does what the summary claims.
+
+A few reinforcing practices. Scope it. Never dump the whole repo into the context window. Feed the relevant modules, not everything. The model will happily summarize irrelevant code if you let it. Treat the model like a junior engineer you mentor. Give it bite-size asks. You hold the judgment. The model proposes, you verify. This keeps you in the driver's seat.
+
+Here's a concrete ClickHouse illustration. You ask "why are `IColumn` operations immutable?" The model tells you it's because ClickHouse's query execution model maps SQL operators directly to column transformations, and immutability prevents accidental sharing bugs. You then verify against the [official ClickHouse architecture doc](https://clickhouse.com/docs/development/architecture) and confirm that `IColumn::filter`, `IColumn::permute`, and `IColumn::cut` map directly to `WHERE`, `ORDER BY`, and `LIMIT` operators. This answer is checkable against real method names in minutes. That's exactly why the workflow works. The model gives you the high-level intent. You confirm it against the implementation. You learn faster than if you had read `IColumn.h` cold, and you learn correctly because you verified.
 
 ## deepwiki vs zread.ai: when to use which
 
