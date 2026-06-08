@@ -44,6 +44,39 @@ Here's a concrete ClickHouse illustration. You ask "why are `IColumn` operations
 
 ## deepwiki vs zread.ai: when to use which
 
+Both tools turn a GitHub repo into an AI-readable map, and both share the same entry trick: swap the host in the URL. `github.com/ClickHouse/ClickHouse` becomes `deepwiki.com/ClickHouse/ClickHouse` or `zread.ai/ClickHouse/ClickHouse`. No clone, no signup for public repos. They are not the same tool, and the difference decides which to open.
+
+| | DeepWiki | zread.ai |
+|---|---|---|
+| Maker | Cognition (the Devin team) | Zhipu AI (GLM models) |
+| Shape | Auto-generated wiki + chat, architecture-first | Structured guide + Ask AI |
+| Community context | None — no Issues, PRs, or commit history | "Hot Discussions" mined from Issues & PRs |
+| Multi-repo / private | Public repos, cloud-only | Multi-repo compare; private-repo support |
+| MCP server | Free, no auth: `mcp.deepwiki.com/mcp` | Requires a paid Z.ai / GLM key |
+| Freshness | Snapshot, regenerated on a schedule (can lag main) | Re-analyzes on demand |
+
+For daily work, wire either one into your AI IDE over MCP so the assistant reads real docs instead of hallucinating. DeepWiki's server is free and needs no auth; zread's needs a paid key.
+
+```bash
+# DeepWiki MCP — free, no auth
+claude mcp add -s user -t http deepwiki https://mcp.deepwiki.com/mcp
+```
+
+```bash
+# zread MCP — requires a Z.ai API key + GLM Coding Plan
+claude mcp add -s user -t http zread \
+  https://api.z.ai/api/mcp/zread/mcp \
+  --header "Authorization: Bearer <your_zai_api_key>"
+```
+
+DeepWiki's MCP exposes three tools: `ask_question`, `read_wiki_contents`, `read_wiki_structure`.
+
+:::caution
+Before you point any of these at proprietary code, check the data flow. The public tiers are cloud services that index your repo on their servers. For closed-source work, prefer a private-repo plan or a self-hosted option.
+:::
+
+Reach for DeepWiki when you want a fast, free, architecture-first first read. Reach for zread.ai when you want community/issue context or to compare repos. Sourcegraph and Greptile are the heavier, enterprise code-search/intelligence tier if that's what you actually need.
+
 ## Where AI falls short
 
 ## The trail in practice: CANNOT_SCHEDULE_TASK
