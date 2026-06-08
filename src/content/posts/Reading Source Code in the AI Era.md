@@ -114,4 +114,18 @@ I wrote up the full hand-investigation — five wrong answers ruled out one at a
 
 ## Takeaways
 
+- **Reading code is non-linear.** Categorize what you're reading before you read it — glue, interface, implementation, algorithm, configuration, tasking — and pick the right question for each kind.
+- **AI cut the orientation cost, not the verification cost.** The model hands you the file and a plausible narrative in minutes; you still have to confirm it is correct.
+- **Ask "why," not just "where."** "Where is the merge logic" gets you a file path; "why does ClickHouse use a greedy merge selector" gets you the reasoning that teaches you the system.
+- **deepwiki vs zread.ai: different strengths.** DeepWiki is free, fast, architecture-first, and has a no-auth MCP server; zread.ai surfaces community/issue context and supports multi-repo compare and private repos.
+- **AI floats plausible-and-wrong hypotheses.** METR found experts went 19% slower trusting AI on their own codebases, and "lost in the middle" plus context rot make this structural, not a prompting problem.
+- **Never let AI read all the code for you.** Orientation is exactly the low-stakes task AI is good at; "understand this entire codebase for me" is exactly the high-stakes task it is bad at.
+
 ## Further reading
+
+- [aredridel, *How To Read Source Code*](https://github.com/aredridel/how-to-read-code/blob/master/how-to-read-code.md)
+- [ClickHouse, *Architecture Overview*](https://clickhouse.com/docs/development/architecture)
+- [ClickHouse, *Agentic coding*](https://clickhouse.com/blog/agentic-coding)
+- [METR, *Measuring the Impact of Early-2025 AI on Developer Productivity*](https://metr.org/blog/2025-07-10-early-2025-ai-experienced-os-dev-study/)
+
+*Related: [Debugging ClickHouse CANNOT_SCHEDULE_TASK](/posts/debugging-clickhouse-cannot-schedule-task/) · [How clickhouse-operator schemaPolicy Creates Schema](/posts/clickhouse-operator-schema-policy/) · [Moving Nodes Out of a Bare-Metal ClickHouse Cluster](/posts/moving-nodes-out-of-a-bare-metal-clickhouse-cluster/)*
