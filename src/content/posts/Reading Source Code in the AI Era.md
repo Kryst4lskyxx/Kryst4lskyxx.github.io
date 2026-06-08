@@ -95,6 +95,23 @@ Don't let AI read *all* the code for you. It is a tool of thought, not a replace
 
 ## The trail in practice: CANNOT_SCHEDULE_TASK
 
+Here is the whole thesis on one real bug — where AI saved hours, and where trusting it would have cost a day.
+
+A production ClickHouse cluster started throwing bursts of error 439. The error text was cryptic:
+
+```
+Code: 439. DB::Exception: Cannot schedule a task:
+  failed to start the thread (threads=3, jobs=3). (CANNOT_SCHEDULE_TASK)
+```
+
+This is exactly where the AI tools earn their keep. I pasted the error into deepwiki's Ask interface and asked "what code path produces `CANNOT_SCHEDULE_TASK`?" Within a minute I had the answer: `ThreadPool.cpp`, the `ThreadPoolImpl::scheduleImpl` function. That is the file I would have otherwise grepped thousands of C++ files to find, and the model got me there in one shot. Orientation phase complete.
+
+Then I asked the model why this happens. It confidently offered the textbook fix: raise `max_thread_pool_size`. This is a perfect example of a plausible-and-wrong hypothesis. It is wrong because a community report failed at around 15000 threads with the ceiling already set to 20000 — failing below the configured limit means the limit is not the constraint. No amount of raising a ClickHouse setting fixes a kernel that is refusing to create threads.
+
+The truth only came from reading the source and the data by hand. Error 439 is really two different errors sharing one code: `no free thread` means ClickHouse's pool is genuinely full; `failed to start the thread` means the kernel refused `pthread_create` or `clone()`. The small `threads=3` count is the tell — the pool was nearly empty. The real cause was a query-admission stampede: hundreds of distributed queries landing in the same second, each demanding pipeline and connection threads. That was proven not by intuition but by querying `system.metric_log` for the failure second, where the only column that moved was the concurrent `Query` count.
+
+I wrote up the full hand-investigation — five wrong answers ruled out one at a time — in [Debugging ClickHouse CANNOT_SCHEDULE_TASK](/posts/debugging-clickhouse-cannot-schedule-task/). The AI got me to the right file in a minute. It could not have gotten me to the right answer. That division of labor — AI for orientation, human for verification — is the whole game.
+
 ## Takeaways
 
 ## Further reading
