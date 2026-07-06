@@ -23,7 +23,7 @@ mount -t tmpfs -o size=250G tmpfs /mnt/chram
 
 Add it as a ClickHouse disk, point a table at it, and reads should fly. The plan was to prove it with the *real* workload: replay the top-10 most-frequent and top-10 most-costly production query patterns against a RAM-disk copy of the table and an NVMe copy, and measure the difference.
 
-I'd just finished a related experiment — trying `min_bytes_to_use_mmap_io` to memory-map the same table's reads — which had gone nowhere for a subtle reason (mmap only engages when a single contiguous per-column read exceeds the threshold, and this table's selective, many-part reads never do). That experience set the habit that saved this one: **read the read path in the source before you benchmark it.**
+I'd just finished [a related experiment — trying `min_bytes_to_use_mmap_io`](/posts/clickhouse-mmap-read-setting/) to memory-map the same table's reads — which had gone nowhere for a subtle reason (mmap only engages when a single contiguous per-column read exceeds the threshold, and this table's selective, many-part reads never do). That experience set the habit that saved this one: **read the read path in the source before you benchmark it.**
 
 ## Read the source first
 
@@ -138,4 +138,4 @@ None of those describe a 20 GB hot table on a 750 GB-RAM NVMe box. There, the pa
 3. **A/B tests on live tables drift.** Different TTLs, different merge states, different ingestion — my two "identical" tables were neither identical in data nor in part count. If the isolating metric hadn't been storage-independent, I'd have shipped a wrong conclusion.
 4. **The most interesting finding is often a side effect.** The RAM disk answered its own question with a flat "no," but the file-descriptor math it forced me to do is the part I'll actually reuse — wide JSON tables plus high part counts sit close to the FD ceiling, and any scheme that keeps a second copy needs a higher `nofile` limit, fewer parts, or both.
 
-The verdict was the same one the [mmap experiment](/posts/clickhouse-read-regression-write-problem/) reached from a different angle: the data is already in RAM. The fastest storage tier for a warm ClickHouse workload is the one the kernel gives you for free.
+The verdict was the same one the [mmap experiment](/posts/clickhouse-mmap-read-setting/) reached from a different angle: the data is already in RAM. The fastest storage tier for a warm ClickHouse workload is the one the kernel gives you for free.
