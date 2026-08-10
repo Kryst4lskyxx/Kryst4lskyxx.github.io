@@ -1,7 +1,7 @@
 ---
 title: "A Throw in a Destructor: Why One ClickHouse Pod Out of Twelve Aborted Itself"
 published: 2026-08-10
-description: "A Kubernetes ClickHouse pod restarted. It wasn't OOMKilled, it wasn't evicted, and it wasn't crash-looping — it called `std::terminate()` on itself. Six of twelve nodes ran out of file descriptors that hour and threw the same error 33 times; exactly one of those throws landed inside a destructor, and destructors are implicitly `noexcept`. This is the walk from `reason=Error` down to `Epoll::Epoll()` in the matched source, why the node with the *highest* FD count survived, and how micro-batched inserts turned a merge dip into a self-reinforcing feedback loop."
+description: "A Kubernetes ClickHouse pod restarted. It wasn't OOMKilled, it wasn't evicted, and it wasn't crash-looping — it called `std::terminate()` on itself. Six of twelve nodes ran out of file descriptors that hour and threw the same error 33 times; exactly one of those throws landed inside a destructor, and destructors are implicitly `noexcept`. This is the walk from `reason=Error` down to `Epoll::Epoll()` in the matched source, why the node with the *highest* FD count survived, and how micro-batched inserts plus a merge pool pinned at 64/64 built a self-reinforcing feedback loop. Includes the metric that made me diagnose it backwards the first time."
 image: ''
 tags: [ClickHouse, Kubernetes, Debugging, File Descriptors, C++, Merges, Observability]
 category: 'Coding'
@@ -274,11 +274,11 @@ The storm is sharply bounded:
 | 21:50 | 752 |
 | **22:00 onward** | **0** |
 
-I checked that the zeros were real and not a logging gap — `text_log` keeps writing 12–44K rows per 30 minutes after 22:00, with `Too many parts` at exactly zero. Merges caught up and it has not recurred.
+I checked that the zeros were real and not a logging gap — `text_log` keeps writing 12–44K rows per 30 minutes after 22:00, with `Too many parts` at exactly zero. Merges caught up. (Whether it *stays* that way is a different question, and I get to it near the end — it doesn't.)
 
-### The thing I expected to find, and didn't
+### The reading I got wrong
 
-I assumed an insert spike. `part_log` says otherwise:
+I assumed an insert spike. `part_log` appeared to say otherwise:
 
 | 30-min bucket | new parts | avg rows/insert | merges | failed merges |
 |---|---|---|---|---|
@@ -289,7 +289,60 @@ I assumed an insert spike. `part_log` says otherwise:
 | 00:30 | 41,160 | 861 | **18,733** | 23 |
 | 01:30 | 42,169 | 792 | **19,640** | 34 |
 
-Inserts are **flat** — 40–45K new parts per 30 minutes, all night, before and after. What moved was **merges**: down to ~12–13K during the incident, back to ~19K once it cleared. This wasn't an ingestion spike. It was a **merge dip** against a chronically high insert rate. CPU was ~17% average, 50% peak — merges weren't CPU-starved either.
+New parts flat at 40–45K per 30 minutes; merges down to ~12–13K during the incident and back to ~19K once it cleared. I wrote that up as "not an ingestion spike — a **merge dip**."
+
+That was wrong, and it's worth showing exactly how, because the numbers above are all *correct*. The mistake was in what they measure.
+
+`part_log`'s `MergeParts` rows count **completed** merges. The fleet-wide gauge counts **running** ones — and it moved the other way:
+
+```promql
+sum(ClickHouseMetrics_Merge{namespace="alert-ch"})
+```
+
+```
+18:00   394
+19:00   487
+19:30   612      ← doubled, not dipped
+20:30   595
+21:30   608
+23:00   377
+00:00   252
+```
+
+Running merges **doubled** — 300–330 before, **614** at the peak. Merges weren't idle, they were saturated. And `InsertedRows` shows there *was* a ramp after all:
+
+```
+16:00  1,070,853  →  20:30  1,367,487  (+28%)  →  23:00  1,220,393
+```
+
+Meanwhile `MergedRows` stayed roughly flat at ~5M per interval despite twice the concurrency. So each merge got slower, completions fell, and the *completed*-merge count dropped — which is precisely what made `part_log` look like a dip when the pool was actually pinned.
+
+Pinned against what? The per-node ceiling is `background_pool_size` × `background_merges_mutations_concurrency_ratio`:
+
+```
+background_pool_size                            32
+background_merges_mutations_concurrency_ratio    2     → 64 merge tasks/node
+```
+
+Peak concurrent merges per pod during the episode:
+
+```
+alert-ch-0-0-0 … alert-ch-3-1-0   peak=64   ← all 8 pods of shards 0–3, AT CEILING
+alert-ch-5-0-0                    peak=40
+alert-ch-5-1-0                    peak=39
+alert-ch-4-1-0                    peak=37
+alert-ch-4-0-0                    peak=33
+```
+
+Exactly 64 on all eight pods of shards 0–3. Not "near" the ceiling — *at* it, flat against it. Shards 4–5 had headroom and were never in trouble.
+
+And that single number retro-explains every asymmetry in this incident: it's the same shards that threw `TOO_MANY_PARTS` locally, the same shards showing `reason=Error` instead of `Completed`, and the same shards whose part counts blew past 3000 while 4–5 stayed under 79.
+
+So the real mechanism is **merge-pool saturation under a diurnal insert ramp**: chronic micro-batching sets a high part-creation floor, a +28% evening ramp pushes the loaded shards to 64/64, completion falls behind creation, and parts sail past 3000. CPU was ~17% average the whole time — this is **pool-limited, not CPU-limited**, so more cores would have changed nothing.
+
+:::caution
+`part_log` counts merges that **finished**; `system.metrics` / `ClickHouseMetrics_Merge` counts merges **running right now**. Under saturation these move in *opposite* directions — completions fall precisely because concurrency is maxed and each merge is slower. Read the completion count alone and you will diagnose an idle merge subsystem that is in fact flat-out.
+:::
 
 ### The feedback loop
 
@@ -361,6 +414,41 @@ Shards 0, 2, 3 were the source. Everyone else just relayed the error. `MaxPartCo
 
 Without splitting local from forwarded, that first query said "all 12 nodes affected" and I'd have chased a cluster-wide cause. Distributed tables propagate errors, so an error appearing on a node is not evidence the node caused it.
 
+## Step 9: Is this the first time? (it isn't)
+
+A single incident tells you what broke. It doesn't tell you whether you're looking at a freak event or the third instance of something with a schedule. `text_log` couldn't answer that — it only retains days. But there's a counter for exactly this, incremented at the throw site (`MergeTreeData.cpp:5449`, one line above the `throw`):
+
+```cpp
+ProfileEvents::increment(ProfileEvents::RejectedInserts);
+throw Exception(ErrorCodes::TOO_MANY_PARTS, …);
+```
+
+Which Prometheus scrapes, and retains for a month:
+
+```promql
+sum(increase(ClickHouseProfileEvents_RejectedInserts{namespace="alert-ch"}[1h]))
+```
+
+Before trusting the zeros, I checked the metric was actually *present* on every pod for the whole window — `count(...)` returns 12 for all 30 days, so the gaps are real gaps and not missing scrapes. Every non-zero hour in 30 days:
+
+| Episode (UTC) | Rejected inserts | Peak parts | Pod abort? |
+|---|---|---|---|
+| Sun 07-19 21:30–22:30 | 1,738 | 3,117 | no |
+| Thu 08-06 09:30 | 222 | — | no |
+| **Thu 08-06 18:30–22:30** | **14,386** | 4,710 | yes |
+| **Sun 08-09 20:30–22:30** | **3,190** | 4,504 | yes (this post) |
+
+Three real episodes, **every one in the 18:30–23:00 UTC band**, and the gap is closing: 18 days, then 3. **Two of the three produced exactly one pod abort each** — and the one that didn't is the smallest. That's the race model making a prediction and the historical data agreeing with it: more EMFILE throws, more chances one lands in the destructor.
+
+The baseline is the part that reframes the whole thing:
+
+```
+daily peak MaxPartCountForPartition, all other days: 73 – 136
+during episodes:                                     3,117 – 4,710
+```
+
+Normal operation sits at ~90 parts against a throw threshold of 3000. This is **not** a system slowly drifting into its ceiling — it's flat, healthy, boring, and then a 30×+ excursion inside an hour. Which means part count is a *terrible* early-warning signal: there's no ramp to alert on. `RejectedInserts > 0` and merge concurrency ≥ 90% of `64/node` both fire before anything is user-visible; part count only tells you after you've already lost.
+
 ## What I ruled out, so nobody re-investigates it
 
 - **OOM / memory pressure.** No `OOMKilled` in the namespace; `reason=Error`. Not a memory incident at all.
@@ -373,10 +461,12 @@ Without splitting local from forwarded, that first query said "all 12 nodes affe
 
 1. **Batch the writes.** Per `insert-batch-size`: 10K–100K rows per INSERT, 1,000 minimum. A p50 of 34 rows is the root cause; everything else in this post is downstream of it.
 2. **If the client can't batch, buffer server-side.** Per `insert-async-small-batches`: `async_insert=1` with `wait_for_async_insert=1`, scoped to the writing user via `ALTER USER … SETTINGS` rather than globally.
-3. **Consider `use_hedged_requests=0`.** This doesn't fix FD exhaustion — it removes the *abort path*, converting this failure class from a crash into an ordinary error. The trade-off is real (you lose hedged-request tail-latency protection), so it's a judgement call, not an obvious win.
-4. **Raise `nofile` on the pod spec.** Widens the margin. Treats the symptom.
+3. **Raise `background_pool_size` on the loaded shards.** 32 (→ 64 merge tasks) is what they pin against during every episode, on 192-logical-core boxes idling at 17% CPU. That's conservative for the hardware. This is the binding constraint *at the moment of failure* — though note it buys headroom rather than removing the need for it.
+4. **Consider `use_hedged_requests=0`.** This doesn't fix FD exhaustion — it removes the *abort path*, converting this failure class from a crash into an ordinary error. The trade-off is real (you lose hedged-request tail-latency protection), so it's a judgement call, not an obvious win.
+5. **Raise `nofile` on the pod spec.** Widens the margin. Treats the symptom.
+6. **Alert on `RejectedInserts > 0`,** not on part count — see Step 9 for why part count gives you no warning.
 
-Note the ordering. Only #1 addresses the cause; #3 addresses the *severity*. Both are worth doing, and it's worth being clear about which is which.
+Note the ordering, because these fix different things. #1 removes the cause. #3 raises the ceiling the cause runs into. #4 changes the *consequence* from a crash to an error without touching either. All three are worth doing; conflating them is how you end up raising a limit and calling it a fix.
 
 ## What I'd take to the next incident
 
@@ -386,6 +476,9 @@ Note the ordering. Only #1 addresses the cause; #3 addresses the *severity*. Bot
 - **`text_log` is worth its retention cost.** Every load-bearing fact in this investigation — the fatal stack, the storm boundaries, the errno, the local-vs-forwarded split — came from it. Without it I'd have had a pod restart and no explanation, and the pre-crash evidence would have died with the process.
 - **Distinguish originated from forwarded errors.** Distributed tables relay exceptions. "All 12 nodes show the error" meant three nodes had the problem.
 - **`avg` hides ingestion pathology; `p50` exposes it.** 760 vs 34.
+- **"Completed" and "running" counters move in opposite directions under saturation.** `part_log` said merges were dwindling; `ClickHouseMetrics_Merge` said they'd doubled and were pinned at the pool ceiling. Both true, and only the second one is the diagnosis. When a subsystem looks *idle* during an incident, check whether you're reading its throughput instead of its concurrency.
+- **A counter at the throw site outlives your logs.** `RejectedInserts` sits one line above the `throw` and lives in Prometheus for a month, which turned "an incident" into "the third episode, and they're accelerating." Look for the ProfileEvent next to the exception; it's the cheapest history you'll ever get.
+- **A healthy baseline can be the alarming part.** ~90 parts on ordinary days against a 3000 threshold sounds like enormous headroom. It actually means there's no ramp to alert on — the system goes from fine to failing inside an hour.
 - **Frequency of a failure ≠ severity of a failure.** Thirty-three identical errors, thirty-two harmless. The node with the most of them was fine; the node with the fewest died. When a failure's consequence depends on *where* it lands, "how bad is the pressure" is the wrong question — ask "how many places can this land, and is any of them fatal?"
 
 And the one that generalizes furthest, past ClickHouse entirely: **teardown paths that allocate are latent aborts.** A destructor that needs a resource in order to release a resource is fine forever, and then it is a SIGABRT — at exactly the moment the system is under the pressure that makes destructors run most.
