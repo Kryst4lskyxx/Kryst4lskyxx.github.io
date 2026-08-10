@@ -1,7 +1,7 @@
 ---
 title: "A Throw in a Destructor: Why One ClickHouse Pod Out of Twelve Aborted Itself"
 published: 2026-08-10
-description: "A Kubernetes ClickHouse pod restarted. It wasn't OOMKilled, it wasn't evicted, and it wasn't crash-looping — it called `std::terminate()` on itself. Six of twelve nodes ran out of file descriptors that hour and threw the same error 33 times; exactly one of those throws landed inside a destructor, and destructors are implicitly `noexcept`. This is the walk from `reason=Error` down to `Epoll::Epoll()` in the matched source, why the node with the *highest* FD count survived, and how micro-batched inserts plus a merge pool pinned at 64/64 built a self-reinforcing feedback loop. Includes the metric that made me diagnose it backwards the first time."
+description: "A Kubernetes ClickHouse pod restarted. It wasn't OOMKilled, it wasn't evicted, and it wasn't crash-looping — it called `std::terminate()` on itself. Six of twelve nodes ran out of file descriptors that hour and threw the same error 33 times; exactly one of those throws landed inside a destructor, and destructors are implicitly `noexcept`. This is the walk from `reason=Error` down to `Epoll::Epoll()` in the matched source, why the crash was a coin-flip rather than a threshold, and how a merge pool pinned at 64/64 by multi-gigabyte merges made a completely different table fail first. Also: three metrics that each pointed at the wrong culprit, and why the table named in the error was responsible for 0.4% of the problem."
 image: ''
 tags: [ClickHouse, Kubernetes, Debugging, File Descriptors, C++, Merges, Observability]
 category: 'Coding'
@@ -204,23 +204,41 @@ Any resource acquisition on a teardown path is a latent abort. It works fine rig
 
 My first instinct was "find the node with the worst FD pressure, that's your victim." That instinct was wrong, and proving it wrong is the most transferable thing in this post.
 
-The only FD metric exposed here is OS-wide:
+My first attempt at proving it used the only FD-ish metric exposed here:
 
 ```promql
 ClickHouseAsyncMetrics_OSOpenFiles{namespace="alert-ch"}
 ```
 
-| Pod | 8h max (spans the incident) | 1h max (now) |
+It peaks around 1.03–1.04M during the incident against a 300–500K baseline, which looks like it's pressing against **1,048,576 — 2²⁰**, the classic `nofile` ceiling. Tidy. I wrote a whole table around it.
+
+**That evidence is junk, and it's worth explaining why**, because the metric name is actively misleading. From the source:
+
+```cpp
+// src/Common/AsynchronousMetrics.cpp:1552
+new_values["OSOpenFiles"] = { open_files, "The total number of opened files on the host machine."
+    " This is a system-wide metric, it includes all the processes on the host machine,"
+    " not just clickhouse-server." };
+```
+
+It reads `/proc/sys/fs/file-nr`. That's **host-wide**, and it's bounded by `fs.file-max` — whose exhaustion gives you **ENFILE**. Our crash was **errno 24 = EMFILE**, the *per-process* `RLIMIT_NOFILE`. The metric doesn't measure the limit that was hit, and on a shared Kubernetes host it isn't even measuring only our process.
+
+Minute-resolution data confirms it tracks nothing useful here:
+
+| Time | OSOpenFiles | |
 |---|---|---|
-| alert-ch-2-0-0 | **1,042,592** | 437,024 |
-| alert-ch-3-1-0 | **1,035,680** | 412,832 |
-| alert-ch-0-0-0 | **1,031,072** | 500,768 |
-| **alert-ch-3-0-0** (died) | **959,648** | 411,296 |
-| … shards 4–5 | 564K–676K | ~290–350K |
+| 20:04 | 991,904 | higher — no crash |
+| 20:23 | 972,320 | higher — no crash |
+| **20:42** | **836,768** | **the crash minute — mid-range** |
+| 21:08 | 1,032,608 | highest of all — healthy, post-restart |
 
-Baseline is 300–500K. During the incident three pods pressed against **1,048,576 — 2²⁰**, the classic `nofile` ceiling. And the pod that died had the *fourth* highest peak. Three nodes were under **more** FD pressure and survived.
+FD pressure at the moment of the crash was *unremarkable*. There's no ramp into it and no peak at it.
 
-The error counts say the same thing even more clearly:
+That kills my quantitative story and leaves the qualitative one stronger: FD exhaustion definitely happened — `errno 24` is logged verbatim at three independent call sites across six nodes — but the crash timing has nothing to do with how much pressure there was.
+
+(Worth noting the gap: **no per-process FD metric is exposed on this cluster at all.** `process_open_fds` via node-exporter's textfile collector, or cAdvisor's `container_file_descriptors`, would have made this a five-minute question instead of a dead end. If you run ClickHouse and can't answer "how many FDs does the server process hold right now" from a dashboard, fix that before you need it.)
+
+The evidence that actually carries the argument is the error counts:
 
 ```sql
 SELECT hostName(), count(), min(event_time), max(event_time)
@@ -239,7 +257,9 @@ alert-ch-1-0-0    2   20:19:53
 alert-ch-2-0-0    2   20:48:49
 ```
 
-**Thirty-three EPOLL_ERRORs across six nodes. One crash.** The other 32 hit call sites where a throw is just an error — a query fails, a merge aborts, life goes on. The node with eleven of them shrugged them all off.
+**Thirty-three EPOLL_ERRORs across six nodes. One crash.** The other 32 hit call sites where a throw is just an error — a query fails, a merge aborts, life goes on. The node with eleven of them shrugged them all off, and the node that died logged its *first* one at the instant it died.
+
+These counts come from `text_log`, are per-process, and mean exactly what they appear to mean — unlike the host-wide gauge above. The conclusion survives losing that table, and is in fact cleaner without it: since pressure wasn't peaking at 20:42, the outcome was decided **purely by where the throw landed.**
 
 So the crash isn't "FD usage crossed a line." It's "an FD failure happened to land inside `~HedgedConnectionsFactory()`." Same pressure, same error, same version — one bad draw. Which means the blast radius scales with how *often* you tear down hedged connections:
 
@@ -262,7 +282,7 @@ in table 'default.alert_thresholds_local'.
 Merges are processing significantly slower than inserts
 ```
 
-3000 is not a coincidence — it's `parts_to_throw_insert`, default at `src/Storages/MergeTree/MergeTreeSettings.cpp:672`, thrown at `src/Storages/MergeTree/MergeTreeData.cpp:5447-5452`, and the cluster runs the default. Three thousand active parts, averaging **99 KiB**, each with its own column files, all open. That's where a million file descriptors went.
+3000 is not a coincidence — it's `parts_to_throw_insert`, default at `src/Storages/MergeTree/MergeTreeSettings.cpp:672`, thrown at `src/Storages/MergeTree/MergeTreeData.cpp:5447-5452`, and the cluster runs the default. Three thousand active parts, averaging **99 KiB**, each with its own set of column files, all open. That's the FD consumption — though as Step 6 covers, I can point at the mechanism but not put a defensible number on it, because this cluster exposes no per-process FD metric.
 
 The storm is sharply bounded:
 
@@ -338,7 +358,57 @@ Exactly 64 on all eight pods of shards 0–3. Not "near" the ceiling — *at* it
 
 And that single number retro-explains every asymmetry in this incident: it's the same shards that threw `TOO_MANY_PARTS` locally, the same shards showing `reason=Error` instead of `Completed`, and the same shards whose part counts blew past 3000 while 4–5 stayed under 79.
 
-So the real mechanism is **merge-pool saturation under a diurnal insert ramp**: chronic micro-batching sets a high part-creation floor, a +28% evening ramp pushes the loaded shards to 64/64, completion falls behind creation, and parts sail past 3000. CPU was ~17% average the whole time — this is **pool-limited, not CPU-limited**, so more cores would have changed nothing.
+So the real mechanism is **merge-pool saturation under a diurnal insert ramp**: a +28% evening ramp pushes the loaded shards to 64/64, completion falls behind creation, and parts sail past 3000. CPU was ~17% average the whole time — this is **pool-limited, not CPU-limited**, so more cores would have changed nothing.
+
+Minute-resolution data pins the causal *order*, which matters because it's the opposite of what "too many parts" suggests:
+
+| Time | Merges | Max parts |
+|---|---|---|
+| 19:30 | 56 | — |
+| **20:00** | **64 — ceiling** | **472** |
+| 20:10 | 63 | 1,592 |
+| 20:23 | 64 | 3,024 ← threshold |
+| 20:23–20:42 | 63–64 | pinned 2,980–3,093 |
+
+The pool hit its ceiling at 20:00 with only **472 parts** on the table. The climb to 3,000 happened over the following 23 minutes, *after* merge capacity was already gone. Parts are the effect, not the cause. (And the plateau at ~3,000 for the last twenty minutes is `parts_to_throw_insert` acting as a clamp — inserts are being rejected, so the count physically can't rise further.)
+
+### Which brings up the obvious question: why so many merges?
+
+I assumed the micro-batching table was flooding the pool with merge work. It isn't — and this is the third time in this investigation that the obvious attribution was wrong.
+
+A merge slot is held for the **entire duration** of a merge, so pool pressure is merge-*seconds*, not merge-*count*. Attributing the 64 slots by total merge time (per node, 19:00–21:00):
+
+| Table | Merges | Avg dur | p99 | Max | Avg output part | **Slots held** |
+|---|---|---|---|---|---|---|
+| `insights_realtime_a_local` | 15,082 | 77.5 s | 780 s | **5,090 s** | 64.5 MiB | **13.5** |
+| `insights_realtime_b_local` | 13,138 | 78.7 s | 422 s | 2,611 s | 268 MiB | **12.0** |
+| `session_summaries_pt1m_local` | 14,603 | 36.3 s | — | 2,791 s | 17.9 MiB | **6.1** |
+| **`alert_thresholds_local`** | **51,145** | **435 ms** | — | — | **832 KiB** | **0.26** |
+
+Three tables hold **67% of all merge time**. And the table I'd been blaming runs **3.4× more merges than the top slot-holder while consuming 0.4% of the pool** — its merges are 832 KiB and finish in under half a second. They're free.
+
+The pool is full of *large* merges: p99 output parts of 1.10 GiB and 4.00 GiB, maxima of 6.56 GiB and **26.34 GiB**, one merge running **85 minutes**. That's `max_bytes_to_merge_at_max_space_in_pool = 50 GiB` working as designed — fewer, bigger parts is good for reads — but each one parks a slot for minutes to over an hour. The evening ramp simply overlaps more of them: occupancy walks 20–30 midday → 47 at 19:00 → 64 at 20:00. (No mutations competed: zero `MutatePart` in the window.)
+
+:::caution
+Merge count and merge-slot pressure can be almost **inversely** distributed. Ranking tables by "how many merges did it run" pointed me at exactly the wrong table. Rank by `sum(duration_ms)` instead — that's what actually consumes the pool.
+:::
+
+### So the noisy table was the canary, not the cause
+
+If it contributes 0.4% of merge pressure, why did *it* breach 3,000 first? Two structural reasons, and neither is "its inserts are the smallest":
+
+```
+68 MergeTree *_local tables:  67 partitioned,  1 UNPARTITIONED
+                                               └── alert_thresholds_local
+```
+
+`parts_to_throw_insert` counts parts **per partition**. Every other table spreads across 3–6+ partitions; this one puts 100% of its parts into a single bucket measured against 3,000. Add the highest part-creation rate on the cluster — 18.5% of all new parts, from a table holding **182 MiB** — and it's the most sensitive object in the system to any loss of merge throughput. It fails first, loudly, while contributing almost nothing to the failure.
+
+:::caution
+The table that throws is not necessarily the table that caused it. `TOO_MANY_PARTS` names whichever table crossed a **per-partition** threshold first — which selects for unpartitioned tables and high part-creation rates, not for whoever consumed the shared merge pool. Check slot occupancy before you go optimize the table in the error message.
+:::
+
+And the fix that immediately suggests itself is a trap. "Just add `PARTITION BY toYYYYMMDD(...)` so the parts spread out" would work on the part count and quietly corrupt the results: this is a `ReplacingMergeTree` whose ORDER BY has **no time component**, so it deduplicates across all time. ReplacingMergeTree only dedups *within* a partition, and merges never span partitions — partitioning by day leaves one surviving duplicate per key per day. A part-count fix that silently changes your data is worse than the part-count problem.
 
 :::caution
 `part_log` counts merges that **finished**; `system.metrics` / `ClickHouseMetrics_Merge` counts merges **running right now**. Under saturation these move in *opposite* directions — completions fall precisely because concurrency is maxed and each merge is slower. Read the completion count alone and you will diagnose an idle merge subsystem that is in fact flat-out.
@@ -459,14 +529,15 @@ Normal operation sits at ~90 parts against a throw threshold of 3000. This is **
 
 ## Fixes, in priority order
 
-1. **Batch the writes.** Per `insert-batch-size`: 10K–100K rows per INSERT, 1,000 minimum. A p50 of 34 rows is the root cause; everything else in this post is downstream of it.
-2. **If the client can't batch, buffer server-side.** Per `insert-async-small-batches`: `async_insert=1` with `wait_for_async_insert=1`, scoped to the writing user via `ALTER USER … SETTINGS` rather than globally.
-3. **Raise `background_pool_size` on the loaded shards.** 32 (→ 64 merge tasks) is what they pin against during every episode, on 192-logical-core boxes idling at 17% CPU. That's conservative for the hardware. This is the binding constraint *at the moment of failure* — though note it buys headroom rather than removing the need for it.
-4. **Consider `use_hedged_requests=0`.** This doesn't fix FD exhaustion — it removes the *abort path*, converting this failure class from a crash into an ordinary error. The trade-off is real (you lose hedged-request tail-latency protection), so it's a judgement call, not an obvious win.
-5. **Raise `nofile` on the pod spec.** Widens the margin. Treats the symptom.
-6. **Alert on `RejectedInserts > 0`,** not on part count — see Step 9 for why part count gives you no warning.
+1. **Raise `background_pool_size` on the loaded shards** (32 → 48–64). Average occupancy is 47 of 64 with sustained pins at the ceiling, on 192-logical-core boxes idling at 17% CPU. This is the binding constraint at the moment of failure, and the only item here that addresses what actually fills the pool. Raise it gradually and watch disk I/O — that's the next constraint behind CPU.
+2. **Batch the noisy table's writes.** Per `insert-batch-size`: 10K–100K rows per INSERT, 1,000 minimum. This is what actually throws, and a 182 MiB table generating 18.5% of cluster-wide part creation is indefensible on its own terms. But be clear-eyed: it will **not** prevent pool saturation.
+3. **If the client can't batch, buffer server-side.** Per `insert-async-small-batches`: `async_insert=1` with `wait_for_async_insert=1`, scoped to the writing user via `ALTER USER … SETTINGS` rather than globally.
+4. **The systemic lever, with a real trade-off:** merge sizing on the big tables (`max_bytes_to_merge_at_max_space_in_pool = 50 GiB`). Lowering it shortens slot holds but yields more, smaller parts and worse reads. Try #1 first.
+5. **Consider `use_hedged_requests=0`.** This doesn't fix FD exhaustion — it removes the *abort path*, converting this failure class from a crash into an ordinary error. The trade-off is real, so it's a judgement call.
+6. **Instrument per-process FDs** (`process_open_fds` / `container_file_descriptors`) and **alert on `RejectedInserts > 0`** rather than on part count — see Steps 6 and 9 for why neither is currently visible until after the fact.
+7. **Raise `nofile` on the pod spec.** Widens the margin. Treats the symptom.
 
-Note the ordering, because these fix different things. #1 removes the cause. #3 raises the ceiling the cause runs into. #4 changes the *consequence* from a crash to an error without touching either. All three are worth doing; conflating them is how you end up raising a limit and calling it a fix.
+Note the ordering, because these fix genuinely different things. #1 raises the ceiling the cause runs into. #2 reduces one table's part production. #5 changes the *consequence* from a crash to a clean error without touching either. Conflating them is how you end up raising a limit and calling it a fix — and, in my case, how I nearly spent the effort optimizing a table responsible for 0.4% of the problem.
 
 ## What I'd take to the next incident
 
@@ -479,6 +550,9 @@ Note the ordering, because these fix different things. #1 removes the cause. #3 
 - **"Completed" and "running" counters move in opposite directions under saturation.** `part_log` said merges were dwindling; `ClickHouseMetrics_Merge` said they'd doubled and were pinned at the pool ceiling. Both true, and only the second one is the diagnosis. When a subsystem looks *idle* during an incident, check whether you're reading its throughput instead of its concurrency.
 - **A counter at the throw site outlives your logs.** `RejectedInserts` sits one line above the `throw` and lives in Prometheus for a month, which turned "an incident" into "the third episode, and they're accelerating." Look for the ProfileEvent next to the exception; it's the cheapest history you'll ever get.
 - **A healthy baseline can be the alarming part.** ~90 parts on ordinary days against a 3000 threshold sounds like enormous headroom. It actually means there's no ramp to alert on — the system goes from fine to failing inside an hour.
+- **Rank shared-resource consumers by time held, not by operation count.** Merge count and merge-slot pressure were nearly inversely distributed here: the table with the most merges used 0.4% of the pool; three tables with far fewer used 67%. The same logic applies to any pool — connections, threads, locks.
+- **Check the metric's own documentation before building on it.** `OSOpenFiles` sounds like "file descriptors this server holds." The source string says host-wide, all processes, and it's bounded by a different limit than the one that broke us. One `grep` would have saved a whole section.
+- **The component named in the error is where the threshold lives, not necessarily where the problem lives.** `TOO_MANY_PARTS` names whatever crossed a per-partition limit first — which selects for unpartitioned, high-churn tables, not for whoever exhausted the shared pool.
 - **Frequency of a failure ≠ severity of a failure.** Thirty-three identical errors, thirty-two harmless. The node with the most of them was fine; the node with the fewest died. When a failure's consequence depends on *where* it lands, "how bad is the pressure" is the wrong question — ask "how many places can this land, and is any of them fatal?"
 
 And the one that generalizes furthest, past ClickHouse entirely: **teardown paths that allocate are latent aborts.** A destructor that needs a resource in order to release a resource is fine forever, and then it is a SIGABRT — at exactly the moment the system is under the pressure that makes destructors run most.
