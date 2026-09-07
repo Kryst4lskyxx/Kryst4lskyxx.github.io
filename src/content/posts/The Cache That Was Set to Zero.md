@@ -1,7 +1,7 @@
 ---
 title: 'The Cache That Was Set to Zero (and Three Wrong Root Causes Before It)'
 published: 2026-09-07
-description: "56% of queries timing out at 13% CPU. Free threads, idle disks, and 99% of thread time in no counter at all. A four-day hunt through a thread pool that was never full, a merge storm that never mattered, and a throughput ceiling nobody had measured — ending at a config value I had printed on the first day and walked straight past."
+description: "56% of queries timing out at 13% CPU. Free threads, idle disks, and 99% of thread time in no counter at all. A four-day hunt through a thread pool that was never full, a merge storm that never mattered, and a throughput ceiling nobody had measured — ending at a config value I had printed on the first day and walked straight past, a metric the bug had fabricated to point me at the wrong subsystem, and an upstream fix that had already been merged four months earlier."
 image: ''
 tags: [ClickHouse, Performance, Debugging, Observability, Big Data Engineering, Concurrency, Caching]
 category: 'Coding'
@@ -291,6 +291,44 @@ decompression-length hold, per granule, at a 0% hit rate *by construction*.
 
 A disabled cache would have been fine. A zero-capacity cache is a pure mutex.
 
+## It's a known bug, fixed four months earlier
+
+After all that, it turns out this is
+[ClickHouse PR #104063](https://github.com/ClickHouse/ClickHouse/pull/104063) —
+"Bypass index uncompressed cache when its size is zero" — merged **four months
+before our incident**. The PR describes the failure better than I did:
+
+> …every skip-index block read acquired the global `CacheBase` mutex twice,
+> evicted itself via `removeOverflow`, and unconditionally incremented
+> `UncompressedCacheMisses` and `UncompressedCacheWeightLost`. With
+> small-`GRANULARITY` skip indexes (`ngrambf_v1`, `bloom_filter`, etc.) this can
+> produce hundreds of thousands of contended mutex acquisitions per query and
+> tens of GB of phantom `UncompressedCacheWeightLost`, with zero
+> `UncompressedCacheHits`.
+
+We were on a patch release that predated the backport, in the same LTS line. A
+version bump would have fixed it.
+
+The regression story is the interesting part. From the PR: the original 2021 code
+only constructed the cache when the configured size was non-zero. That `if (size)`
+guard was later **removed so the cache could be resized at runtime** via
+`SYSTEM RELOAD CONFIG`. The *data* uncompressed cache survived that change,
+because `MergeTreeReadPoolBase` independently gates it on
+`pool_settings.use_uncompressed_cache`. The index-read path had no equivalent
+guard, so it quietly lost its protection and nobody noticed for years — because
+you only feel it with low-granularity skip indexes under real concurrency.
+
+The fix adds an explicit `index_uncompressed_cache_enabled` flag and returns
+`nullptr` from the getter, so `MergeTreeReaderStream::init` takes the `else`
+branch it was always supposed to take.
+
+:::note
+Worth saying plainly: the diagnosis was right, the mechanism was right, and the
+fix worked — and all of it was still four months of rediscovering something
+already fixed upstream. Reading the changelog for the versions between yours and
+current is cheaper than any of this.
+:::
+
 ## The proof
 
 Everything above is inference from counters. Three days after the fix I finally
@@ -340,10 +378,16 @@ full mutex cost for a 0% hit rate. And then I chased the **data** uncompressed
 cache instead — because that one had a visibly terrible 8.5% hit rate and was
 evicting 1.29 GB per query.
 
-The reason that misled me is worth knowing: **the `UncompressedCache*`
-ProfileEvents are shared between the data cache and the index cache.** The awful
-hit rate I was staring at wasn't data-cache thrash. It was the broken index path,
-showing up in a counter I'd attributed to something else.
+The reason that misled me is worse than shared counters, and the upstream PR
+spells it out: the zero-capacity index cache **unconditionally incremented
+`UncompressedCacheMisses` and `UncompressedCacheWeightLost`** on every single
+read. Those events are shared between the two caches, so the "terrible data
+cache" I was staring at was **phantom accounting fabricated by the bug itself**.
+
+That's an unusually nasty failure mode. The broken subsystem didn't just hide —
+it generated a plausible, quantitative, *wrong* signal that pointed at its
+neighbour. I followed the evidence, and the evidence was manufactured. The 1.29 GB
+"evicted per query" never happened; nothing was ever cached to evict.
 
 I ran a test, found that disabling the data cache made queries 27% faster, and
 recommended it. That was real — turning it off partly avoided the broken path.
@@ -488,8 +532,15 @@ would have redirected the entire investigation on day one. I ran it on day three
 explicit "is this intentional, and what does off cost us?" before you look
 anywhere else.
 
-**Know which counters are shared.** I spent a day on the data uncompressed cache
-because its ProfileEvents were reporting the index cache's pain.
+**Know which counters are shared — and which are fabricated.** I spent a day on
+the data uncompressed cache because a broken subsystem was writing invented
+misses and evictions into counters I attributed to its neighbour. Shared metrics
+are bad enough; metrics a bug actively manufactures are worse, because they look
+like exactly the kind of hard evidence you're taught to trust.
+
+**Read the changelog between your version and current.** The whole thing was
+fixed upstream four months before it hit us, in a patch release of the same LTS
+line. That's a boring lesson and it would have saved all of it.
 
 **Match on load before claiming a baseline.** Two of my three wrong answers came
 from measuring "idle" behaviour in a window that wasn't idle.
