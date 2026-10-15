@@ -244,7 +244,7 @@ Upstream [PR #118624](https://github.com/ClickHouse/ClickHouse/pull/118624) corr
 
 The investigated cluster ran a private build based on `25.8.11.66`. Its build metadata did not identify the exact private source commit. I therefore reproduced the failure on the official `clickhouse/clickhouse-server:25.8.11.66` image.
 
-The [regression fixture](https://github.com/Kryst4lskyxx/ClickHouse/blob/4138b42d4e28e707f277844ac9ed50f0c81e1710/tests/queries/0_stateless/03702_distributed_analyzer_connection_version.sh) created a small `Memory` table. It inserted three rows: `('a', 2)`, `('a', 3)`, and `('b', 7)`. A persistent distributed table read that table through two logical shards.
+The [regression fixture](https://github.com/ClickHouse/ClickHouse/pull/125992/files) created a small `Memory` table. It inserted three rows: `('a', 2)`, `('a', 3)`, and `('b', 7)`. A persistent distributed table read that table through two logical shards.
 
 Both logical shards pointed at the same test server. The duplicated input was intentional. The expected result was `a=10`, `b=14`, and a total of `24`.
 
@@ -270,18 +270,20 @@ A separate control changed the proxy's reported application version to `25.8`. I
 
 That control differed from the earlier Go experiment, which reported `26.31.0`. Both experiments changed application metadata without upgrading the native protocol. Both avoided the failure after that change.
 
+Fresh tests also reproduced the failure on official `26.8.27.9` and `26.9.19.9` binaries. Version-only controls passed on both releases. The 26.9 control kept the analyzer enabled because that release rejects disabling it on an initial query.
+
 The committed test also covers an old `22.8` initiator and explicit analyzer precedence. Those cases describe required patch behavior. The patched server still needs to pass the complete test.
 
-For a server with the ClickHouse test configuration, the stateless runner can execute the fixture. The shell test expects `clickhouse-client` and Python 3. Run it from the patched source tree:
+For a patched `26.8` server with the ClickHouse test configuration, the stateless runner can execute the fixture. The shell test expects `clickhouse-client` and Python 3. Run it from the patched source tree:
 
 ```bash
 ./tests/clickhouse-test --queries tests/queries --no-random-settings \
-    03702_distributed_analyzer_connection_version
+    05394_distributed_analyzer_connection_version
 ```
 
 ## A configuration workaround for the Go service
 
-Disabling the analyzer for this query succeeded in the controlled run. It made both servers use the old interpreter. That provided a temporary escape, but it did not support the move to the new analyzer.
+On 25.8, disabling the analyzer for this query succeeded in the controlled run. It made both servers use the old interpreter. That provided a temporary escape, but it did not support the move to the new analyzer.
 
 Enabling the analyzer only in the Go service failed in both tested forms. The driver configuration and SQL `SETTINGS` clause reached the same omission path. A client upgrade alone also does not correct the server's choice of version fields.
 
@@ -326,7 +328,9 @@ The [configuration definition](https://github.com/ClickHouse/ClickHouse/blob/v25
 
 ## The patch and the release boundary
 
-The [draft patch in my fork](https://github.com/Kryst4lskyxx/ClickHouse/pull/1) targets exactly `v25.8.11.66-lts`. Its base points at commit `fa393206741c830da77b8f1bcf18c753161932c8`. The change moves the current query kind before the branch and uses the connecting server's version.
+The [official ClickHouse PR](https://github.com/ClickHouse/ClickHouse/pull/125992) targets the affected `26.8` LTS branch. Development `master` already removed the old analysis path. The patch moves the current query kind before the branch and uses the connecting server's version.
+
+The [upstream issue](https://github.com/ClickHouse/ClickHouse/issues/125989) records the released-version reproductions and version-only controls.
 
 The relevant logic becomes:
 
@@ -345,29 +349,30 @@ if (query_kind == ClientInfo::QueryKind::SECONDARY_QUERY
 
 The patch preserves the existing fallback for an actual older server. It also preserves explicit analyzer choices from that server. It changes no native protocol fields.
 
-As of October 15, 2026, newer source trees had different states. The following table separates released tags from development source. Source inspection does not replace a runtime test of each version.
+As of 2026-10-15, newer source trees had different states. The following table separates released tags from development source. Source inspection does not replace a runtime test of each version.
 
 | Source | Status of this compatibility path |
 | --- | --- |
 | [`v25.8.11.66-lts`](https://github.com/ClickHouse/ClickHouse/blob/v25.8.11.66-lts/src/Server/TCPHandler.cpp#L2233-L2244) | Wrong application-version comparison and late query-kind assignment |
 | [`v25.8.33.6-lts`](https://github.com/ClickHouse/ClickHouse/blob/v25.8.33.6-lts/src/Server/TCPHandler.cpp#L2251-L2262) | Both defects remain in the inspected source |
+| [`v26.8.27.9-lts`](https://github.com/ClickHouse/ClickHouse/blob/v26.8.27.9-lts/src/Server/TCPHandler.cpp#L2780-L2797) | Both defects remain, and the official binary reproduces the failure |
 | [`v26.9.19.9-stable`](https://github.com/ClickHouse/ClickHouse/blob/v26.9.19.9-stable/src/Server/TCPHandler.cpp#L2826-L2839) | Query-kind ordering is corrected, but the application-version comparison remains |
-| [Inspected master commit](https://github.com/ClickHouse/ClickHouse/tree/88ab77112e1e40485b17f27f42da13d5364a1aae) | The old analyzer compatibility path is removed |
+| [Inspected master commit](https://github.com/ClickHouse/ClickHouse/tree/17a0ca309467320fcd36bc8850bd193455d84fd8) | The old analyzer compatibility path is removed |
 
 GitHub identified [`v26.9.19.9-stable`](https://github.com/ClickHouse/ClickHouse/releases/tag/v26.9.19.9-stable) as the latest stable release during this investigation. Upstream [PR #120311](https://github.com/ClickHouse/ClickHouse/pull/120311) removed the old analysis implementation on the 26.10 development line. That removal did not supply a backport for the deployed 25.8 tag.
 
-The changed `TCPHandler.cpp` compiled as a translation unit on macOS arm64 with Clang `23.1.3`. A translation unit is one source file compiled with its headers. This compiled the actual changed code, but it did not produce a complete server.
+The 25.8 variant of the changed `TCPHandler.cpp` compiled as a translation unit on macOS arm64 with Clang `23.1.3`. A translation unit is one source file compiled with its headers. This compiled the actual changed code, but it did not produce a complete server.
 
 The local build used the project's `WERROR=OFF` option. The default build stopped on new compiler warnings in existing headers. The patch changed no build rules or compiler flags.
 
-The draft PR remains open because runtime work remains. The following table records the evidence boundary:
+The official PR is open. A full build and runtime test of the patched 26.8 server remain pending. The following table records the evidence boundary:
 
 | Claim or artifact | Evidence status |
 | --- | --- |
 | Coordinator and remote used different analyzers | Observed in runtime query records |
 | Application version controls the failing branch | Isolated by version-only controls |
-| The failure exists outside the private build | Reproduced on the official 25.8.11.66 image |
-| Changed C++ file compiles | Passed with `WERROR=OFF` |
+| The failure exists outside the private build | Reproduced on official 25.8.11.66, 26.8.27.9, and 26.9.19.9 binaries |
+| The 25.8 patch translation unit compiles | Passed with `WERROR=OFF` |
 | Shell and embedded Python syntax | Passed, including optimized Python |
 | Full server build with the patch | Pending |
 | Complete regression test on the patched server | Pending |
