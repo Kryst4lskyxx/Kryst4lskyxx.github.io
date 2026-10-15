@@ -1,6 +1,6 @@
 # About
 
-Hi, I'm kryst4lskyxx — a big data engineer interested in the intersection of large-scale data systems and the tools that make engineering faster and less painful.
+Hi, I'm Ye — a big data engineer interested in the intersection of large-scale data systems and the tools that make engineering faster and less painful.
 
 I work on big data infrastructure — designing and debugging ingestion pipelines, storage engines, and the systems that sit between raw data and actionable insight. ClickHouse is a recurring focus: its internals, performance characteristics, and how to integrate it effectively into production pipelines.
 
