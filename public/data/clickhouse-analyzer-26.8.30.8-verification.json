@@ -1,0 +1,75 @@
+{
+  "verified_on": "2026-10-19",
+  "release": {
+    "tag": "v26.8.30.8-lts",
+    "commit": "da45179b6c6761981c969859d168dd93b2bfd550",
+    "architecture": "linux/arm64",
+    "package": "clickhouse-common-static-26.8.30.8-arm64.tgz",
+    "sha512": "fc6fd360eeeb1ce18529c04bc2107413aeaa207802b5fd1bf0f6dea0972a5bb480cc5035f99d82692826ba0aaeb8340885668afc42a4cbfc41111f4d0d1d72e8",
+    "checksum_verified": true,
+    "url": "https://github.com/ClickHouse/ClickHouse/releases/tag/v26.8.30.8-lts"
+  },
+  "fix": {
+    "pull_request": "https://github.com/ClickHouse/ClickHouse/pull/125992",
+    "merge_commit": "1ff9640e041d60c190c495a11e999f8d8da34e77"
+  },
+  "topology": {
+    "physical_servers": 1,
+    "logical_shards": 2,
+    "transport": "native TCP"
+  },
+  "test_account": {
+    "allow_experimental_analyzer": 1,
+    "apply_settings_from_server": 1
+  },
+  "query_configuration": {
+    "prefer_localhost_replica": 0,
+    "use_query_cache": 0
+  },
+  "expected_result": {
+    "a": 10,
+    "b": 14,
+    "total": 24
+  },
+  "released_fixture": {
+    "url": "https://github.com/ClickHouse/ClickHouse/blob/v26.8.30.8-lts/tests/queries/0_stateless/05394_distributed_analyzer_connection_version.sh",
+    "direct_run": "full reference matched",
+    "bash_tracing": true,
+    "official_runner_passed": 5,
+    "official_runner_skipped": 0,
+    "simulated_old_peer": "22.8",
+    "old_peer_implicit_analyzer_results": [
+      0,
+      0
+    ],
+    "old_peer_explicit_analyzer_result": 1
+  },
+  "actual_go_client": {
+    "version": "2.31.0",
+    "host_architecture": "darwin/arm64",
+    "protocol_revision": 54460,
+    "connection_pool_limit": 1,
+    "queries_passed": 60,
+    "queries_per_mode": {
+      "profile_default": 20,
+      "explicit_analyzer_1": 20,
+      "explicit_analyzer_0": 20
+    },
+    "initial_queries": 60,
+    "secondary_queries": 120
+  },
+  "baseline": {
+    "version": "26.8.27.9",
+    "native_fixture": "first aggregation passed. Second failed with code 10",
+    "actual_go_client": "first aggregation passed. Second failed with code 10",
+    "error": "NOT_FOUND_COLUMN_IN_BLOCK",
+    "missing_column": "__table1.event_name",
+    "error_code": 10,
+    "failing_query_number": 2
+  },
+  "scope": {
+    "isolated_local_tests": true,
+    "production_rollout_tested": false,
+    "analytics_http_api_tested": false
+  }
+}
